@@ -141,18 +141,20 @@ class AsyncSimpleStorageManager(TransferQueueStorageManager):
                         if isinstance(arg, str) and arg in self.storage_unit_infos.keys():
                             server_key = arg
                             break
-
+                # 查找StorageUnit的ip、端口等信息
                 server_info = self.storage_unit_infos.get(server_key)
 
                 if not server_info:
                     raise RuntimeError(f"Server {server_key} not found in registered servers")
 
+                # 创建socket
                 context = zmq.asyncio.Context()
                 address = format_zmq_address(server_info.ip, server_info.ports.get(socket_name))
                 identity = f"{self.storage_manager_id}_to_{server_info.id}_{uuid4().hex[:8]}".encode()
                 sock = create_zmq_socket(context, zmq.DEALER, server_info.ip, identity)
 
                 try:
+                    # 连接StorageUnit，设置接收 发送超时时间
                     sock.connect(address)
                     # Timeouts to avoid indefinite await on recv/send
                     sock.setsockopt(zmq.RCVTIMEO, timeout * 1000)
@@ -161,7 +163,7 @@ class AsyncSimpleStorageManager(TransferQueueStorageManager):
                         f"[{self.storage_manager_id}]: Connected to StorageUnit {server_info.id} at {address} "
                         f"with identity {identity.decode()}"
                     )
-
+                    # 注入socket并调用原函数。
                     kwargs["socket"] = sock
                     return await func(self, *args, **kwargs)
                 except Exception as e:
@@ -185,6 +187,7 @@ class AsyncSimpleStorageManager(TransferQueueStorageManager):
             return wrapper
 
         return decorator
+
 
     def _group_by_hash(self, global_indexes: list[int]) -> dict[str, RoutingGroup]:
         """Group samples by global_idx % num_su, return {storage_id: RoutingGroup}.
@@ -285,6 +288,8 @@ class AsyncSimpleStorageManager(TransferQueueStorageManager):
         else:
             return field_data[positions]
 
+
+    # SimpleStorageManager的put_data
     async def put_data(self, data: TensorDict, metadata: BatchMeta) -> None:
         """
         Send data to remote StorageUnit based on metadata.
@@ -303,10 +308,14 @@ class AsyncSimpleStorageManager(TransferQueueStorageManager):
 
         if batch_size == 0:
             return
-
+        """
+        提取fields的schema
+        {'messages': {'dtype': None, 'shape': None, 'is_nested': False, 'is_non_tensor': True}}
+        """
         field_schema = extract_field_schema(data)
-
+        # 根据global_index 确定每条数据要发送到哪个StorageUnit里面
         routing = self._group_by_hash(metadata.global_indexes)
+        # 并发存储到多个storage_unit里面去
         tasks = [
             self._put_to_single_storage_unit(
                 group.global_indexes,
@@ -317,6 +326,7 @@ class AsyncSimpleStorageManager(TransferQueueStorageManager):
         ]
 
         try:
+            # 多项成等待所有StorageUnit的数据存储完毕
             await asyncio.gather(*tasks)
         except Exception as e:
             logger.error(
@@ -329,19 +339,21 @@ class AsyncSimpleStorageManager(TransferQueueStorageManager):
             raise
 
         partition_id = metadata.partition_ids[0]
+        # 通知controller，data已经更新了
         await self.notify_data_update(
             partition_id,
             metadata.global_indexes,
             field_schema,
         )
 
+    # 自动完成socket的创建-> 链接-> 注入-> 关闭
     @dynamic_storage_manager_socket(socket_name="put_get_socket", timeout=TQ_SIMPLE_STORAGE_SEND_RECV_TIMEOUT)
     async def _put_to_single_storage_unit(
         self,
         global_indexes: list[int],
         storage_data: dict[str, Any],
         target_storage_unit: str,
-        socket: zmq.Socket = None,
+        socket: zmq.Socket = None, # 装饰器注入的socket地址，和StorageUnit连接
     ):
         """
         Send data to a specific storage unit.
@@ -349,12 +361,13 @@ class AsyncSimpleStorageManager(TransferQueueStorageManager):
 
         request_msg = ZMQMessage.create(
             request_type=ZMQRequestType.PUT_DATA,  # type: ignore[arg-type]
-            sender_id=self.storage_manager_id,
-            receiver_id=target_storage_unit,
+            sender_id=self.storage_manager_id, # StorageManager
+            receiver_id=target_storage_unit, # StorageUnit
             body={"global_indexes": global_indexes, "data": storage_data},
         )
 
         try:
+            # StoreManager 将 body序列化发送给 StorageUnit，接收响应
             data = request_msg.serialize()
             await socket.send_multipart(data, copy=False)
             messages = await socket.recv_multipart(copy=False)
@@ -438,9 +451,10 @@ class AsyncSimpleStorageManager(TransferQueueStorageManager):
 
         if metadata.size == 0:
             return TensorDict({}, batch_size=0)
-
+        # 根据全局索引决定去哪个StorageUnit找数据。
         routing = self._group_by_hash(metadata.global_indexes)
 
+        # 并发获取数据
         tasks = [
             self._get_from_single_storage_unit(group.global_indexes, metadata.field_names, target_storage_unit=su_id)
             for su_id, group in routing.items()
@@ -458,6 +472,8 @@ class AsyncSimpleStorageManager(TransferQueueStorageManager):
             raise
 
         # Scatter results directly to batch positions — no intermediate per-sample dict
+
+        # 把各个StorageUnit返回的数据按照batch_positions放回正确位置，和原始global_indexes一致。
         n = len(metadata.global_indexes)
         ordered_data: dict[str, list] = {field: [None] * n for field in metadata.field_names}
 
@@ -483,7 +499,7 @@ class AsyncSimpleStorageManager(TransferQueueStorageManager):
             request_type=ZMQRequestType.GET_DATA,  # type: ignore[arg-type]
             sender_id=self.storage_manager_id,
             receiver_id=target_storage_unit,
-            body={"global_indexes": global_indexes, "fields": fields},
+            body={"global_indexes": global_indexes, "fields": fields}, # 找全局索引的fields字段数据
         )
         try:
             await socket.send_multipart(request_msg.serialize())

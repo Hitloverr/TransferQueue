@@ -468,7 +468,7 @@ class Trainer:
             meta = KVBatchMeta(
                 keys=sampled_keys,
                 tags=[{} for _ in sampled_keys],
-                partition_id=f"train_{step}",
+                partition_id=f"train_{step}", # train_step作为partition_id
                 fields=["messages"],
             )
             logger.info(f"demo get KVBatchMeta {meta}")

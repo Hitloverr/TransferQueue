@@ -380,7 +380,7 @@ class AsyncTransferQueueClient:
             >>> # This will create metadata in "insert" mode internally.
             >>> metadata = asyncio.run(client.async_put(data=prompts_repeated_batch, partition_id=current_partition_id))
         """
-
+        # client会走到这里来，put的最终入口
         if not hasattr(self, "storage_manager") or self.storage_manager is None:
             raise RuntimeError(
                 f"[{self.client_id}]: Storage manager not initialized. "
@@ -408,6 +408,7 @@ class AsyncTransferQueueClient:
         if not metadata or metadata.size == 0:
             raise ValueError("metadata cannot be none or empty")
 
+        # 限制pytorch并行线程数的上下文管理器，避免过度并行化；每个client的put_data操作最多TQ_NUM_THREADS个线程
         with limit_pytorch_auto_parallel_threads(
             target_num_threads=TQ_NUM_THREADS, info=f"[{self.client_id}] async_put"
         ):

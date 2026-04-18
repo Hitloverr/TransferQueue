@@ -85,10 +85,11 @@ def _maybe_create_transferqueue_storage(conf: DictConfig) -> DictConfig:
             storage_placement_group = get_placement_group(num_data_storage_units, num_cpus_per_actor=1)
 
             for storage_unit_rank in range(num_data_storage_units):
+                # ray的方法，将SimpleStorageUnit放置到特定的placement group中。Ray 的资源调度单元，用于协同调度多个 actor
                 storage_node = SimpleStorageUnit.options(  # type: ignore[attr-defined]
                     placement_group=storage_placement_group,
                     placement_group_bundle_index=storage_unit_rank,
-                    name=f"TransferQueueStorageUnit#{storage_unit_rank}",
+                    name=f"TransferQueueStorageUnit#{storage_unit_rank}", # actor制定名称
                 ).remote(
                     storage_unit_size=math.ceil(total_storage_size / num_data_storage_units),
                 )
