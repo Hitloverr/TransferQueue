@@ -331,6 +331,7 @@ class TestGRPOGroupNSampler:
     def test_grpo_sampler_no_complete_groups(self):
         """Test behavior when no complete groups are available."""
         sampler = GRPOGroupNSampler(n_samples_per_prompt=3)
+        # 没有任何完整的连续3 index 元祖，返回空，同一prompt的所有响应必须一起处理，不能遗漏
         ready_indexes = [0, 1, 3, 4, 6, 7]  # No consecutive groups of size 3
         batch_size = 6
 
@@ -347,6 +348,7 @@ class TestGRPOGroupNSampler:
 
         # Should find the complete groups [3,4,5] and [9,10,11]
         sampled, consumed = sampler.sample(ready_indexes, batch_size)
+        # 返回连续的三元组。
         assert sampled == [3, 4, 5, 9, 10, 11]
         assert consumed == [3, 4, 5, 9, 10, 11]
 
@@ -716,6 +718,7 @@ class TestSeqlenBalancedSampler:
         ready_indexes = [0, 1, 2, 3]
         batch_size = 2  # per-DP → global = 4
 
+        # 不同dp_rank, 应该不同数据
         sampled_0, consumed_0 = sampler.sample(
             ready_indexes,
             batch_size,
@@ -781,7 +784,7 @@ class TestSeqlenBalancedSampler:
             partition_id="p0",
             dp_rank=0,
             batch_index=0,
-            partition=partition,
+            partition=partition, # custom data
         )
         sampled_1, _ = sampler.sample(
             ready_indexes,
@@ -790,7 +793,7 @@ class TestSeqlenBalancedSampler:
             partition_id="p0",
             dp_rank=1,
             batch_index=0,
-            partition=partition,
+            partition=partition, # custom data
         )
 
         # All indexes should be covered
@@ -798,6 +801,7 @@ class TestSeqlenBalancedSampler:
         assert all_sampled == [0, 1, 2, 3]
 
         # KK should pair one long with one short per rank for balance
+        # 负载均衡
         def total_len(indices):
             lengths = {0: 100, 1: 100, 2: 10, 3: 10}
             return sum(lengths[i] for i in indices)
@@ -859,6 +863,7 @@ class TestSeqlenBalancedSampler:
 
     def test_caching_returns_same_result(self):
         """Test that repeated calls with same key return cached result."""
+        # 相同dp_rank的返回相同结果
         sampler = SeqlenBalancedSampler(n_samples_per_prompt=1, dp_size=2)
         ready_indexes = [0, 1, 2, 3]
 
@@ -881,6 +886,8 @@ class TestSeqlenBalancedSampler:
 
         assert sampled_first == sampled_second
 
+
+    # 不同batch_index产生不同的缓存key，不同批次的采样结果不会混淆
     def test_different_batch_index_not_cached(self):
         """Test that different batch_index produces different cache keys."""
         sampler = SeqlenBalancedSampler(n_samples_per_prompt=1, dp_size=1)
@@ -1069,7 +1076,7 @@ class TestKarmarkarKarp:
         """Test equal-size partitioning with balanced inputs."""
         seqlens = [10, 20, 30, 40]
         partitions = get_seqlen_balanced_partitions(seqlens, k_partitions=2, equal_size=True)
-
+        # 分区结果是[0,3] [1,2] 结果都是50
         assert len(partitions) == 2
         assert all(len(p) == 2 for p in partitions)
         # All indices covered
@@ -1082,11 +1089,13 @@ class TestKarmarkarKarp:
 
         sums = [sum(seqlens[i] for i in p) for p in partitions]
         # Difference should be small relative to total
+        # 两个分区的权重之差应该小于等于最大单个权重
         assert abs(sums[0] - sums[1]) <= max(seqlens)
 
     def test_unequal_size(self):
         """Test variable-size partitioning."""
         seqlens = [100, 10, 10, 10, 10]
+        # 允许不同数量的分组
         partitions = get_seqlen_balanced_partitions(seqlens, k_partitions=2, equal_size=False)
 
         assert len(partitions) == 2
@@ -1118,7 +1127,7 @@ class TestKarmarkarKarp:
         partitions = get_seqlen_balanced_partitions(seqlens, k_partitions=3, equal_size=True)
 
         assert len(partitions) == 3
-        assert all(len(p) == 2 for p in partitions)
+        assert all(len(p) == 2 for p in partitions) # equal_size 
         assert sorted(sum(partitions, [])) == [0, 1, 2, 3, 4, 5]
 
     def test_identical_seqlens(self):
@@ -1172,6 +1181,7 @@ class TestSamplerIntegration:
             # Check return types
             assert isinstance(sampled, list)
             assert isinstance(consumed, list)
+
             assert isinstance(sampled[0], int) if sampled else True
             assert isinstance(consumed[0], int) if consumed else True
 

@@ -19,7 +19,73 @@ from transfer_queue.sampler import BaseSampler
 
 
 class GRPOGroupNSampler(BaseSampler):
-    """Group-based sampler for reinforcement learning and multi-sample generation workflows.
+    """分组采样器，用于强化学习和多样本生成工作流。
+
+    本采样器实现无放回的分组采样，专为需要从同一输入 prompt 生成多个样本
+    或需要分组采样的场景设计。它确保属于同一 prompt 的所有样本要么一起被
+    选中，要么全部不被选中，从而在整个训练过程中保持 prompt 分组的完整性。
+
+    典型应用场景 —— GRPO (Group Relative Policy Optimization)：
+        在 GRPO 训练中，需要从同一个 prompt 生成多个响应，然后基于所有响应
+        计算相对奖励来训练策略。这要求同一 prompt 的所有响应必须作为一个整体
+        被采样和处理。
+
+    工作原理::
+
+        假设 n_samples_per_prompt = 3，每个 prompt 生成 3 个样本
+
+        数据组织（连续存储）:
+            ready_indexes = [0, 1, 2,    ← prompt A 的 3 个样本
+                            3, 4, 5,    ← prompt B 的 3 个样本
+                            6, 7,       ← prompt C 的 2 个样本（不完整）
+                            9, 10, 11]  ← prompt D 的 3 个样本
+
+        采样 batch_size = 6:
+
+            分组检测:
+                [0, 1, 2] → 连续 ✓ → 完整组
+                [3, 4, 5] → 连续 ✓ → 完整组
+                [6, 7, 9] → 不连续 ✗ → 跳过
+                [9, 10, 11] → 连续 ✓ → 完整组
+
+            结果:
+                sampled_indexes  = [0, 1, 2, 3, 4, 5]  ← 取前 2 个完整组
+                consumed_indexes = [0, 1, 2, 3, 4, 5]
+
+    核心逻辑：
+        1. 对 ready_indexes 排序
+        2. 扫描寻找连续的 N 个索引（完整组）
+        3. 只返回完整组，不完整组被跳过
+        4. 如果完整组数量不足，返回空列表
+
+    数据组织要求：
+        用户必须将同一 prompt 的多个样本连续存储。例如：
+        ``[prompt1_sample1, prompt1_sample2, prompt2_sample1, prompt2_sample2, ...]``
+
+        即 ready_indexes 应类似：
+        ``[prompt1_sample1, prompt1_sample2, prompt1_sample3, prompt1_sample4,
+          prompt2_sample1, prompt2_sample2, prompt2_sample3, prompt2_sample4, ...]``
+
+    使用示例::
+
+        from transfer_queue import TransferQueueController, GRPOGroupNSampler
+
+        # 初始化：每个 prompt 生成 4 个样本
+        controller = TransferQueueController.remote(
+            sampler=GRPOGroupNSampler(n_samples_per_prompt=4)
+        )
+
+        # 获取元数据
+        meta = await client.async_get_meta(
+            data_fields=["input_ids", "generated_text", "reward"],
+            batch_size=16,  # 16 个样本 = 4 个 prompt × 4 个样本/prompt
+            partition_id="train",
+            task_name="grpo_training",
+        )
+
+    ---
+
+    Group-based sampler for reinforcement learning and multi-sample generation workflows.
 
     This sampler implements grouped sampling without replacement, specifically designed
     for scenarios where multiple samples need to be generated from the same input prompt
@@ -70,7 +136,20 @@ class GRPOGroupNSampler(BaseSampler):
         self,
         n_samples_per_prompt: int = 1,
     ):
-        """Initialize the GRPOGroupNSampler.
+        """初始化 GRPO 分组采样器。
+
+        参数：
+            n_samples_per_prompt: 每个 prompt 的样本数量。必须大于 0。
+                例如设为 4 表示每个 prompt 生成 4 个响应样本，
+                采样时会确保这 4 个样本要么全部选中，要么全部不选。
+
+        示例::
+            >>> # 每个 prompt 生成 8 个响应
+            >>> sampler = GRPOGroupNSampler(n_samples_per_prompt=8)
+
+        ---
+
+        Initialize the GRPOGroupNSampler.
 
         The sampler maintains minimal internal state and relies on runtime
         configuration through the sampling_config parameter.
@@ -94,7 +173,58 @@ class GRPOGroupNSampler(BaseSampler):
         *args: Any,
         **kwargs: Any,
     ) -> tuple[list[int], list[int]]:
-        """Sample groups of indices from the ready indices.
+        """从就绪索引中按分组方式采样。
+
+        本方法实现分组完整性验证，确保只有完整的组才会被采样。
+        如果完整组数量不足，返回空列表。
+
+        采样流程::
+
+            1. 检查缓存：如果已有该 (partition_id, task_name, dp_rank, batch_index) 的结果，直接返回
+            2. 参数校验：batch_size 必须是 n_samples_per_prompt 的倍数
+            3. 排序扫描：对 ready_indexes 排序后扫描寻找连续组
+            4. 完整性检查：检查 N 个索引是否连续（差值均为 1）
+            5. 结果缓存：将采样结果缓存到 _states 中，确保分布式训练的一致性
+
+        参数：
+            ready_indexes: 所有必需字段已产生且未被消费的样本全局索引列表。
+                这些索引应按 prompt 分组连续组织。
+            batch_size: 要选择的样本总数。必须是 n_samples_per_prompt 的倍数。
+                例如 n_samples_per_prompt=4，batch_size=16 会选择 4 个完整组。
+            task_name: 训练任务的唯一标识符，用于状态缓存和追踪消费样本。
+            partition_id: 分区 ID，用于数据版本管理和状态组织。
+            *args: 额外位置参数（当前实现中被忽略）。
+            **kwargs: 额外关键字参数，关键参数包括：
+                - dp_rank: 数据并行 rank，用于多 GPU 训练的状态缓存组织。
+                - batch_index: 当前批次索引，用于追踪消费进度。
+
+        返回：
+            tuple[list[int], list[int]]: 包含两个列表的元组：
+                - sampled_indexes: 选中的全局索引列表，长度为 batch_size；
+                  如果完整组不足则返回空列表。
+                - consumed_indexes: 要标记为已消费的索引列表，与 sampled_indexes 相同
+                  （无放回语义）。
+
+        异常：
+            ValueError: 当 batch_size 不是 n_samples_per_prompt 的倍数时抛出。
+
+        示例::
+            >>> sampler = GRPOGroupNSampler(n_samples_per_prompt=3)
+            >>> # 无完整组的情况
+            >>> ready_indexes = [0, 1, 3, 4, 6, 7]
+            >>> sampled, consumed = sampler.sample(ready_indexes, 6)
+            >>> sampled
+            []
+
+            >>> # 有完整组的情况
+            >>> ready_indexes = [0, 1, 3, 4, 5, 6, 7, 9, 10, 11]
+            >>> sampled, consumed = sampler.sample(ready_indexes, 6)
+            >>> sampled
+            [3, 4, 5, 9, 10, 11]  # 两个完整组
+
+        ---
+
+        Sample groups of indices from the ready indices.
 
         This method implements group completeness validation and ensures that only complete
         groups are sampled. It returns empty lists if insufficient complete groups are available.
@@ -188,5 +318,5 @@ class GRPOGroupNSampler(BaseSampler):
                 states[dp_rank][batch_index] = (sampled_indexes, consumed_indexes)
             if partition_id not in self._states:
                 self._states[partition_id] = {}
-            self._states[partition_id][task_name] = states
+            self._states[partition_id][task_name] = states  # 每个分区，每个任务： dp_rank, batch_index
         return sampled_indexes, consumed_indexes

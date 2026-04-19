@@ -25,7 +25,68 @@ logger.setLevel(os.getenv("TQ_LOGGING_LEVEL", logging.WARNING))
 
 
 class SeqlenBalancedSampler(GRPOGroupNSampler):
-    """Sequence-length balanced sampler that extends GRPOGroupNSampler.
+    """序列长度均衡采样器，继承自 GRPOGroupNSampler。
+
+    本采样器先使用 GRPO 分组逻辑选择完整的 prompt 组（保证分组完整性），
+    然后使用 Karmarkar-Karp 均衡分区算法将选中的样本重新分配到各 DP rank，
+    使每个 rank 获得大致相同的 token 总数。
+
+    为什么需要序列长度均衡？
+        在分布式训练中，如果按顺序分配样本，各 rank 可能收到长度差异很大的数据：
+
+        不均衡分配（SequentialSampler）::
+            Rank 0: [长文本, 长文本, 长文本] → 3000 tokens → 计算耗时 3s
+            Rank 1: [短文本, 短文本, 短文本] → 500 tokens  → 计算耗时 0.5s
+            → Rank 1 空等 Rank 2.5s，GPU 利用率低
+
+        均衡分配（SeqlenBalancedSampler）::
+            Rank 0: [长文本, 短文本, 短文本] → 1700 tokens → 计算耗时 1.7s
+            Rank 1: [长文本, 短文本, 短文本] → 1800 tokens → 计算耗时 1.8s
+            → rank 间等待时间最小化，GPU 利用率高
+
+    工作流程：
+        每个 DP rank 独立调用 ``sample()`` 并传入自己的 ``dp_rank``。
+        对于给定 ``(partition_id, task_name, batch_index)`` 的**第一次**调用，
+        采样器执行以下步骤：
+
+        1. **全局 GRPO 采样**：调用 ``GRPOGroupNSampler.sample()`` 获取
+           ``global_batch_size = batch_size × dp_size`` 的完整 prompt 组。
+        2. **查询序列长度**：从分区的 ``custom_meta`` 中获取每个样本的
+           ``total_lengths``（在数据插入时填充）。
+        3. **Karmarkar-Karp 分区**：运行 KK 算法（``get_seqlen_balanced_partitions``）
+           将样本按组级别均衡分配到 ``dp_size`` 个 rank。
+        4. **缓存分配结果**：将各 rank 的分配结果缓存，后续调用直接返回。
+
+        流程图::
+
+            第一次调用 (dp_rank=0):
+            ┌──────────────────────────────────────────────────┐
+            │ Step 1: GRPO 分组采样 (global_batch_size)       │
+            │   → 选中完整 prompt 组: [组0, 组1, 组2, 组3]    │
+            ├──────────────────────────────────────────────────┤
+            │ Step 2: 查询 total_lengths                      │
+            │   → 组0: 500 tokens, 组1: 200 tokens,           │
+            │     组2: 300 tokens, 组3: 400 tokens             │
+            ├──────────────────────────────────────────────────┤
+            │ Step 3: Karmarkar-Karp 均衡分区                  │
+            │   → Rank 0: [组0, 组1] = 700 tokens              │
+            │   → Rank 1: [组2, 组3] = 700 tokens              │
+            ├──────────────────────────────────────────────────┤
+            │ Step 4: 缓存 + 返回 dp_rank=0 的部分             │
+            └──────────────────────────────────────────────────┘
+            后续调用 (dp_rank=1, 相同 cache_key):
+            → 直接返回缓存的 Rank 1 分配结果
+
+    前置要求：
+        - 每个样本的 ``custom_meta`` 必须包含 ``{"total_lengths": <int>}``。
+        - Controller 调用采样器时必须在 kwargs 中传入
+          ``partition=<DataPartitionStatus>``。
+        - 传入的 ``batch_size`` 是**每个 DP rank** 的批次大小；采样器内部
+          会乘以 ``dp_size`` 得到全局批次大小用于初始 GRPO 采样。
+
+    ---
+
+    Sequence-length balanced sampler that extends GRPOGroupNSampler.
 
     This sampler first uses the GRPO group-N logic to select complete prompt
     groups (ensuring group integrity), then redistributes the selected
@@ -57,11 +118,29 @@ class SeqlenBalancedSampler(GRPOGroupNSampler):
     """
 
     def __init__(self, n_samples_per_prompt: int = 1, dp_size: int = 1):
+        """初始化序列长度均衡采样器。
+
+        参数：
+            n_samples_per_prompt: 每个 prompt 的样本数量（继承自 GRPOGroupNSampler）。
+                例如设为 4 表示每个 prompt 生成 4 个响应样本。
+            dp_size: 数据并行规模（DP rank 数量）。采样器会按此数量
+                将样本均衡分配到各 rank。例如设为 2 表示 2 个 DP rank。
+
+        示例::
+            >>> # 4 个样本/prompt，2 个 DP rank
+            >>> sampler = SeqlenBalancedSampler(n_samples_per_prompt=4, dp_size=2)
+
+        初始化后会创建 ``_balanced_cache`` 用于缓存均衡分区结果。
+
+        ---
+
+        Initialize the sequence-length balanced sampler.
+        """
         super().__init__(n_samples_per_prompt=n_samples_per_prompt)
         if dp_size <= 0:
             raise ValueError(f"dp_size must be positive, got {dp_size}")
         self.dp_size = dp_size
-        # Cache: (partition_id, task_name, batch_index) -> list[list[int]]
+        # 缓存: (partition_id, task_name, batch_index) -> list[list[int]]
         self._balanced_cache: dict[tuple, list[list[int]]] = {}
 
     def sample(
@@ -73,7 +152,41 @@ class SeqlenBalancedSampler(GRPOGroupNSampler):
         *args: Any,
         **kwargs: Any,
     ) -> tuple[list[int], list[int]]:
-        """Sample indices for a specific DP rank with seqlen balancing.
+        """为指定 DP rank 采样索引，并进行序列长度均衡。
+
+        本方法在 GRPO 分组采样的基础上，使用 Karmarkar-Karp 算法将样本
+        按序列长度均衡分配到各 DP rank，使每个 rank 的 token 总数近似相等。
+
+        采样流程（首次调用时）::
+
+            1. 缓存检查 → 如有缓存直接返回
+            2. GRPO 全局采样 → batch_size × dp_size 个样本
+            3. 查询 total_lengths → 从 custom_meta 获取序列长度
+            4. 分组聚合 → 将同 prompt 组的 token 数求和作为组权重
+            5. KK 均衡分区 → 按组权重将 prompt 组分配到各 rank
+            6. 展开回样本索引 → 组索引 → 样本索引
+            7. 缓存所有 rank 的分配结果
+
+        参数：
+            ready_indexes: 就绪的全局索引列表。
+            batch_size: **每个 DP rank** 请求的批次大小（非全局）。
+                采样器内部会乘以 dp_size 得到全局批次大小。
+            task_name: 任务标识符。
+            partition_id: 分区标识符。
+            **kwargs: 必须包含以下参数：
+                - dp_rank: 当前 DP rank 编号
+                - batch_index: 当前批次索引
+                - partition: Controller 传入的 ``DataPartitionStatus`` 对象，
+                  用于获取 custom_meta 中的 total_lengths
+
+        返回：
+            tuple[list[int], list[int]]: 包含两个列表的元组：
+                - sampled_indexes: 当前 dp_rank 分配到的全局索引
+                - consumed_indexes: 要标记为已消费的索引（与 sampled_indexes 相同）
+
+        ---
+
+        Sample indices for a specific DP rank with seqlen balancing.
 
         Args:
             ready_indexes: List of ready global indices.
@@ -190,7 +303,17 @@ class SeqlenBalancedSampler(GRPOGroupNSampler):
         return sampled, sampled.copy()
 
     def clear_cache(self, partition_id: str):
-        """Clear cached states for the given partition."""
+        """清除指定分区的缓存状态。
+
+        同时清除父类的 _states 缓存和本类的 _balanced_cache 缓存，
+        确保未来采样操作不会引用过时的数据。
+
+        参数：
+            partition_id: 要清除缓存的分区 ID。
+
+        ---
+
+        Clear cached states for the given partition."""
         super().clear_cache(partition_id)
         keys_to_remove = [k for k in self._balanced_cache if k[0] == partition_id]
         for k in keys_to_remove:
@@ -199,7 +322,42 @@ class SeqlenBalancedSampler(GRPOGroupNSampler):
 
 # Copied from https://github.com/volcengine/verl/blob/468adf22c43b744348051fccd7a5d830c6c3c36a/verl/utils/seqlen_balancing.py
 def karmarkar_karp(seqlen_list: list[int], k_partitions: int, equal_size: bool):
-    """Partition items into k groups with balanced sums using the Karmarkar-Karp largest differencing method.
+    """使用 Karmarkar-Karp 最大差分法将项目均衡分区。
+
+    本算法将一组带权重的项目划分为 k 个分区，使各分区的权重之和
+    尽可能接近。基于堆的贪心合并策略，优先合并差异最大的分区对。
+
+    算法原理（以 2 路分区为例）::
+        输入: [8, 7, 6, 5, 4]
+
+        Step 1: 排序配对
+            (8,7) → 差值 1 → 合并为 {8,7}
+            (6,5) → 差值 1 → 合并为 {6,5}
+            (4)   → 单独一个
+
+        Step 2: 继续合并差异最大的对
+            {8,7} 与 {6,5} → 差值 |15-11|=4
+            合并: {8,5} vs {7,6} → 和分别为 13, 13
+
+        结果: 分区0=[8,5]=13, 分区1=[7,6]=13 ✓ 完美均衡
+
+    参数：
+        seqlen_list: 要分区的序列长度（或权重）列表。
+        k_partitions: 要创建的分区数量。
+        equal_size: 如果为 True，强制每个分区包含相同数量的项目
+            （要求 ``len(seqlen_list) % k_partitions == 0``）。
+            如果为 False，只考虑均衡权重之和，每个分区可以有
+            不同数量的项目。
+
+    返回：
+        list[list[int]]: k 个分区的列表，每个分区是原始索引的列表。
+
+    参考：
+        https://en.wikipedia.org/wiki/Largest_differencing_method
+
+    ---
+
+    Partition items into k groups with balanced sums using the Karmarkar-Karp largest differencing method.
 
     See: https://en.wikipedia.org/wiki/Largest_differencing_method
 
@@ -214,9 +372,18 @@ def karmarkar_karp(seqlen_list: list[int], k_partitions: int, equal_size: bool):
     """
 
     class Set:
-        """A weighted set that tracks items and their cumulative sum for partitioning."""
+        """带权重的集合，用于追踪项目和累积和以支持分区。"""
 
         def __init__(self) -> None:
+            """带权重的集合，用于追踪项目和累积和以支持分区。
+
+            Attributes:
+                sum: 集合中所有项目的权重之和
+                items: 项目列表，每个元素为 (原始索引, 权重) 元组
+
+            ---
+
+            A weighted set that tracks items and their cumulative sum for partitioning."""
             self.sum = 0
             self.items: list[tuple[int, int]] = []
 
@@ -237,7 +404,13 @@ def karmarkar_karp(seqlen_list: list[int], k_partitions: int, equal_size: bool):
             return self.items < other.items
 
     class State:
-        """A k-way partition state used in the Karmarkar-Karp heap-based merge process."""
+        """K 路分区状态，用于 Karmarkar-Karp 堆合并过程。
+
+        维护 k 个 Set 集合，支持合并操作以逐步均衡分区。
+
+        ---
+
+        A k-way partition state used in the Karmarkar-Karp heap-based merge process."""
 
         def __init__(self, items: list[tuple[int, int]], k: int) -> None:
             self.k = k
@@ -320,7 +493,31 @@ def karmarkar_karp(seqlen_list: list[int], k_partitions: int, equal_size: bool):
 
 
 def get_seqlen_balanced_partitions(seqlen_list: list[int], k_partitions: int, equal_size: bool):
-    """get order of seq lengths to make partitions balanced, this is
+    """获取序列长度的均衡分区顺序，用于平衡 DP rank 和微批次间的序列长度之和。
+
+    本函数是 Karmarkar-Karp 算法的外层封装，在返回结果前会进行验证和排序，
+    确保所有索引都被恰好分配一次。
+
+    参数：
+        seqlen_list (list[int]): 每个项目的序列长度（权重）列表。
+        k_partitions (int): 要创建的分区数量。
+        equal_size (bool):
+            - True: 每个分区必须包含相同数量的项目
+            - False: 只考虑均衡权重之和，每个分区可以有不同数量的项目
+
+    返回：
+        list[list[int]]: k 个分区的列表，每个分区包含原始项目的索引。
+
+    示例::
+        >>> lengths = [100, 200, 300, 50, 150, 250]
+        >>> partitions = get_seqlen_balanced_partitions(lengths, k_partitions=2, equal_size=True)
+        >>> # 结果类似: [[1, 3, 5], [0, 2, 4]]
+        >>> # 分区0的 token 总和: 200+50+250=500
+        >>> # 分区1的 token 总和: 100+300+150=550
+
+    ---
+
+    get order of seq lengths to make partitions balanced, this is
         used in balancing sum of seqlength across dp ranks and microbatches
     Parameters:
         seqlen_list (List[int]):
