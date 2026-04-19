@@ -45,6 +45,16 @@ bytestr: TypeAlias = bytes | bytearray | memoryview
 class ZMQRequestType(ExplicitEnum):
     """
     Enumerate all available request types in TransferQueue.
+
+    类别	消息类型	作用
+    握手	HANDSHAKE / HANDSHAKE_ACK	StorageUnit ↔ Controller 建立连接
+    数据操作	GET_DATA, PUT_DATA, CLEAR_DATA 等	存取数据
+    元数据操作	GET_META, GET_PARTITION_META 等	获取/设置元数据
+    消费追踪	GET_CONSUMPTION, RESET_CONSUMPTION	追踪样本消费状态
+    生产追踪	GET_PRODUCTION, PRODUCTION_RESPONSE	追踪生产进度
+    KV接口	KV_RETRIEVE_META, KV_LIST 等	KV 存储接口
+    通知	NOTIFY_DATA_UPDATE 等	数据更新通知
+
     """
 
     # HANDSHAKE
@@ -108,6 +118,7 @@ class ZMQRequestType(ExplicitEnum):
 class ZMQServerInfo:
     """
     TransferQueue server info class.
+    zmq 服务端的身份信息
     """
 
     def __init__(self, role: TransferQueueRole, id: str, ip: str, ports: dict[str, int]):

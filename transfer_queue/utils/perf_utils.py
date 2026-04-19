@@ -53,8 +53,9 @@ class IntervalPerfMonitor:
 
     def __init__(self, caller_name: str):
         self.caller_name = caller_name
+        # 避免频繁刷新写日志
         self.last_flush_time = time.perf_counter()
-
+        # key: op_type value：调用次数，处理时间
         self.success_counts: dict[str, int] = defaultdict(int)
         self.process_time: dict[str, list[float]] = defaultdict(list)
 
@@ -111,6 +112,7 @@ class IntervalPerfMonitor:
             self.process_time.clear()
             self.last_flush_time = now
 
+    # 上下文管理器，统计op_type的调用次数和调用时间
     @contextmanager
     def measure(self, op_type: str):
         """Measures performance statistics."""

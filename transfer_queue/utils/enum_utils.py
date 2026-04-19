@@ -34,6 +34,7 @@ class ExplicitEnum(str, Enum):
 
     @classmethod
     def _missing_(cls, value):
+        # 相比普通枚举更友好，会直接告诉我们枚举的有效值有哪些
         raise ValueError(
             f"{value} is not a valid {cls.__name__}, please select one of {list(cls._value2member_map_.keys())}"
         )
@@ -41,7 +42,7 @@ class ExplicitEnum(str, Enum):
 
 class TransferQueueRole(ExplicitEnum):
     """Available Roles of TransferQueue."""
-
+    # 三种角色：TransferQueueController TransferQueueStorage TrasferQueueClient
     CONTROLLER = "TransferQueueController"
     STORAGE = "TransferQueueStorage"
     CLIENT = "TransferQueueClient"
